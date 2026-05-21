@@ -7,6 +7,117 @@ MODDIR="${MODDIR:-${0%/*}/..}"
 ####################################
 # Docs : https://blog.xzr.moe/archives/15/#section-24
 
+set_cpufreq_governor() {
+    local policy="$1"
+    local governors gov
+
+    [ -d "$policy" ] || return 0
+    governors="$(cat "$policy/scaling_available_governors" 2>/dev/null)"
+
+    for gov in schedutil conservative powersave; do
+        if echo "$governors" | grep -qw "$gov"; then
+            write "$policy/scaling_governor" "$gov"
+            return 0
+        fi
+    done
+
+    return 0
+}
+
+cap_cpufreq_policy() {
+    local policy="$1"
+    local max min cap percent
+
+    [ -d "$policy" ] || return 0
+    max="$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)"
+    min="$(cat "$policy/scaling_min_freq" 2>/dev/null)"
+
+    echo "$max" | grep -qE '^[0-9]+$' || return 0
+    echo "$min" | grep -qE '^[0-9]+$' || min=0
+
+    # Dynamic cluster cap for Dimensity-class layouts such as Poco X7 Pro.
+    # Bigger clusters get a stronger cap; no value is locked, so Franco Kernel
+    # Manager or PowerHAL may override it later without fighting chmod tricks.
+    if [ "$max" -ge 3200000 ]; then
+        percent=68
+    elif [ "$max" -ge 2800000 ]; then
+        percent=72
+    elif [ "$max" -ge 2200000 ]; then
+        percent=78
+    else
+        percent=85
+    fi
+
+    cap=$((max * percent / 100))
+    [ "$cap" -lt "$min" ] && cap="$min"
+    write "$policy/scaling_max_freq" "$cap"
+}
+
+apply_cpu_energy_profile() {
+    local policy
+
+    for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$policy" ] || continue
+        set_cpufreq_governor "$policy"
+        cap_cpufreq_policy "$policy"
+        write_if_writable "$policy/schedutil/up_rate_limit_us" "20000"
+        write_if_writable "$policy/schedutil/down_rate_limit_us" "5000"
+        write_if_writable "$policy/schedutil/hispeed_freq" "0"
+        write_if_writable "$policy/schedutil/pl" "0"
+        write_if_writable "$policy/schedutil/iowait_boost_enable" "0"
+    done
+}
+
+set_devfreq_governor() {
+    local dev="$1"
+    local governors gov
+
+    [ -d "$dev" ] || return 0
+    governors="$(cat "$dev/available_governors" 2>/dev/null)"
+
+    for gov in powersave simple_ondemand userspace; do
+        if echo "$governors" | grep -qw "$gov"; then
+            write "$dev/governor" "$gov"
+            return 0
+        fi
+    done
+
+    return 0
+}
+
+cap_devfreq_device() {
+    local dev="$1"
+    local max min cap
+
+    [ -d "$dev" ] || return 0
+    max="$(cat "$dev/max_freq" 2>/dev/null)"
+    min="$(cat "$dev/min_freq" 2>/dev/null)"
+
+    echo "$max" | grep -qE '^[0-9]+$' || return 0
+    echo "$min" | grep -qE '^[0-9]+$' || min=0
+
+    cap=$((max * 70 / 100))
+    [ "$cap" -lt "$min" ] && cap="$min"
+    write "$dev/max_freq" "$cap"
+}
+
+apply_gpu_energy_profile() {
+    local dev base
+
+    for dev in /sys/class/devfreq/*; do
+        [ -d "$dev" ] || continue
+        base="${dev##*/}"
+
+        case "$base" in
+            *gpu*|*mali*|*ged*|*kgsl*)
+                set_devfreq_governor "$dev"
+                cap_devfreq_device "$dev"
+                write_if_writable "$dev/polling_interval" "50"
+                ;;
+        esac
+    done
+}
+
 # Vendor Specific Tuning
 # Qualcomm Tuning
 if [ "$(getprop ro.hardware)" = "qcom" ]; then 
@@ -71,10 +182,19 @@ if [ "$(getprop ro.hardware)" = "qcom" ]; then
 else 
 #Mediatek Tuning
     write  "/sys/kernel/ged/hal/custom_upbound_gpu_freq" "0"
-    write  "/sys/module/ged/parameters/is_GED_KPI_enabled" "1"
+    write  "/sys/module/ged/parameters/is_GED_KPI_enabled" "0"
     write  "/sys/module/mtk_core_ctl/parameters/policy_enable" "0"
     write "/sys/kernel/ged/hal/dcs_mode" "0"
     write "/proc/mtk_lpm/cpuidle/enable" "1"
+    write_if_writable "/sys/module/ged/parameters/gpu_idle" "1"
+    write_if_writable "/sys/module/ged/parameters/gx_game_mode" "0"
+    write_if_writable "/sys/module/ged/parameters/ged_smart_boost" "0"
+    write_if_writable "/sys/module/ged/parameters/boost_gpu_enable" "0"
+    write_if_writable "/sys/module/ged/parameters/enable_cpu_boost" "0"
+    write_if_writable "/sys/module/ged/parameters/ged_boost_enable" "0"
+    write_if_writable "/sys/module/ged/parameters/ged_force_mdp_enable" "0"
+    write_if_writable "/sys/module/mtk_fpsgo/parameters/boost_affinity" "0"
+    write_if_writable "/sys/module/mtk_fpsgo/parameters/bypass_flag" "1"
 fi
 
 # WALT
@@ -136,6 +256,11 @@ else
         write $i "1000"
     done
 fi
+
+# Reassert the battery profile after vendor scheduler blocks so later generic
+# rate-limit writes in this script do not undo the final CPU/GPU policy.
+apply_cpu_energy_profile
+apply_gpu_energy_profile
 
 # Round Robin Timeslice
 # write "/proc/sys/kernel/sched_rr_timeslice_ms" "4"

@@ -25,10 +25,10 @@ for io in /sys/block/* ; do
     case "$block" in
         sd*|mmcblk*|nvme*)
             # Physical block devices benefit from request merging and can keep
-            # iostats. Many Android kernels expose these as read-only, so leave
-            # readonly nodes intact.
+            # request affinity. Disable iostats for a battery profile because
+            # it is accounting/debug visibility rather than a runtime need.
             write_if_writable "$io/queue/nomerges" "0"
-            write_if_writable "$io/queue/iostats" "1"
+            write_if_writable "$io/queue/iostats" "0"
             write "$io/queue/rq_affinity" "1"
             ;;
         dm-*|loop*|zram*|ram*|mtdblock*)
@@ -41,7 +41,7 @@ for io in /sys/block/* ; do
         *)
             # Default to conservative physical-device behavior for unknown block types.
             write_if_writable "$io/queue/nomerges" "0"
-            write_if_writable "$io/queue/iostats" "1"
+            write_if_writable "$io/queue/iostats" "0"
             write "$io/queue/rq_affinity" "1"
             ;;
     esac

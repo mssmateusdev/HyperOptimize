@@ -102,9 +102,66 @@ apply_adaptive_vm_tunables() {
     write "/proc/sys/vm/dirtytime_expire_seconds" "43200"
 }
 
+configure_2gb_zram() {
+    local zram dev size alg streams
+
+    zram="/sys/block/zram0"
+    dev="/dev/block/zram0"
+    size="2147483648"
+    streams="2"
+
+    [ -d "$zram" ] || return 0
+
+    # Keep zRAM small and predictable for battery-focused profiles. This avoids
+    # pushing memory pressure into UFS while staying light enough for 2GB zRAM.
+    swapoff "$dev" >/dev/null 2>&1
+    write "$zram/reset" "1"
+
+    if [ -f "$zram/comp_algorithm" ]; then
+        if grep -qw "lz4" "$zram/comp_algorithm" 2>/dev/null; then
+            alg="lz4"
+        elif grep -qw "lzo-rle" "$zram/comp_algorithm" 2>/dev/null; then
+            alg="lzo-rle"
+        elif grep -qw "zstd" "$zram/comp_algorithm" 2>/dev/null; then
+            alg="zstd"
+        else
+            alg=""
+        fi
+        [ -n "$alg" ] && write "$zram/comp_algorithm" "$alg"
+    fi
+
+    write_if_writable "$zram/max_comp_streams" "$streams"
+    write "$zram/disksize" "$size"
+
+    # Disable zRAM writeback where exposed; writing cold compressed pages to
+    # flash saves RAM but costs wakeups and UFS I/O, which is bad for battery.
+    write_if_writable "$zram/writeback_limit_enable" "0"
+    write_if_writable "$zram/writeback_limit" "0"
+
+    if command -v mkswap >/dev/null 2>&1 && [ -e "$dev" ]; then
+        mkswap "$dev" >/dev/null 2>&1
+        swapon -p 32767 "$dev" >/dev/null 2>&1
+    fi
+}
+
 # Scale VM policy by RAM size and swap/zram availability instead of forcing
 # one set of ratios on every device.
 apply_adaptive_vm_tunables
+
+# Poco X7 Pro / HyperOS battery profile: assume 2GB zRAM and prefer compressed
+# RAM over flash churn, while keeping dirty pages small enough to avoid bursts.
+configure_2gb_zram
+write "/proc/sys/vm/swappiness" "55"
+write "/proc/sys/vm/vfs_cache_pressure" "90"
+write "/proc/sys/vm/page-cluster" "0"
+write "/proc/sys/vm/dirty_ratio" "8"
+write "/proc/sys/vm/dirty_background_ratio" "3"
+write "/proc/sys/vm/dirty_expire_centisecs" "1000"
+write "/proc/sys/vm/dirty_writeback_centisecs" "3000"
+write "/proc/sys/vm/dirtytime_expire_seconds" "43200"
+write_if_writable "/proc/sys/vm/compact_unevictable_allowed" "0"
+write_if_writable "/proc/sys/vm/watermark_boost_factor" "0"
+write_if_writable "/proc/sys/vm/watermark_scale_factor" "125"
 
 write "/sys/kernel/mm/lru_gen/enabled" "7"
 # lock_val "1000" "/sys/kernel/mm/lru_gen/min_ttl_ms"
